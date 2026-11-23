@@ -56,6 +56,11 @@
 #include "rtgui/options.h"
 #include "rtgui/version.h"
 
+// libjpeg-turbo 3.0 added jpeg12_read_scanlines() and jpeg16_read_scanlines(),
+// which decode 12-bit lossy and 9 to 16-bit lossless JPEGs
+#if defined(LIBJPEG_TURBO_VERSION_NUMBER) && LIBJPEG_TURBO_VERSION_NUMBER >= 3000000
+#define RT_JPEG_HIGH_PRECISION
+#endif
 
 using namespace std;
 using namespace rtengine;
@@ -104,6 +109,65 @@ auto to_long(const Iterator &iter, Integer n = Integer{0}) -> decltype(
     return iter->toLong(n);
 #endif
 }
+
+#ifdef RT_JPEG_HIGH_PRECISION
+template <typename Sample>
+void jpegRowToRgb16(const Sample *in, unsigned short *out, unsigned int width, int components, float scale)
+{
+    // Image16::setScanline() takes RGB only, so grayscale is expanded here
+    const int step = components == 1 ? 0 : 1;
+
+    for (unsigned int i = 0; i < width; ++i, in += components) {
+        out[3 * i] = in[0] * scale + 0.5f;
+        out[3 * i + 1] = in[step] * scale + 0.5f;
+        out[3 * i + 2] = in[2 * step] * scale + 0.5f;
+    }
+}
+
+// Decodes a JPEG with more than 8 bits per sample into RGB with 16 bits per
+// sample, scaling white_level to 65535.
+bool readJPEGScanlines16(j_decompress_ptr cinfo, ImageIO &image, ProgressListener *pl, float white_level)
+{
+    const unsigned int width = cinfo->output_width;
+    const int components = cinfo->output_components;
+    const float scale = 65535.f / white_level;
+
+    // Allocated from the decompressor's pool, so jpeg_destroy_decompress()
+    // frees them, also when a decoding error longjmps out of this function.
+    void *const in = (*cinfo->mem->alloc_large)(reinterpret_cast<j_common_ptr>(cinfo), JPOOL_IMAGE, static_cast<size_t>(width) * components * sizeof(J16SAMPLE));
+    unsigned short *const out = static_cast<unsigned short*>((*cinfo->mem->alloc_large)(reinterpret_cast<j_common_ptr>(cinfo), JPOOL_IMAGE, static_cast<size_t>(width) * 3 * sizeof(unsigned short)));
+
+    while (cinfo->output_scanline < cinfo->output_height) {
+        const unsigned int row = cinfo->output_scanline;
+
+        if (cinfo->data_precision <= 12) {
+            J12SAMPROW in12 = static_cast<J12SAMPROW>(in);
+
+            if (jpeg12_read_scanlines(cinfo, &in12, 1) < 1) {
+                return false;
+            }
+
+            jpegRowToRgb16(in12, out, width, components, scale);
+        } else {
+            J16SAMPROW in16 = static_cast<J16SAMPROW>(in);
+
+            if (jpeg16_read_scanlines(cinfo, &in16, 1) < 1) {
+                return false;
+            }
+
+            jpegRowToRgb16(in16, out, width, components, scale);
+        }
+
+        image.setScanline(row, reinterpret_cast<const unsigned char*>(out), 16);
+
+        if (pl && !(cinfo->output_scanline % 100)) {
+            pl->setProgress((double)(cinfo->output_scanline) / cinfo->output_height);
+        }
+    }
+
+    return true;
+}
+#endif
 
 }
 
@@ -484,6 +548,50 @@ int ImageIO::loadJPEGFromMemory (const char* buffer, int bufsize)
     return IMIO_SUCCESS;
 }
 
+int ImageIO::getJPEGSampleFormat (const Glib::ustring &fname, IIOSampleFormat &sFormat, IIOSampleArrangement &sArrangement)
+{
+    sFormat = IIOSF_UNSIGNED_CHAR;
+    sArrangement = IIOSA_CHUNKY;
+
+#ifdef RT_JPEG_HIGH_PRECISION
+    std::unique_ptr<FILE, void (*)(FILE *)> file(
+        g_fopen(fname.c_str(), "rb"),
+        [](FILE *f) {
+            fclose(f);
+        });
+
+    if (!file) {
+        return IMIO_CANNOTREADFILE;
+    }
+
+    jpeg_decompress_struct cinfo;
+    jpeg_error_mgr jerr;
+    cinfo.err = my_jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+
+    my_jpeg_stdio_src (&cinfo, file.get());
+
+#if defined( _WIN32 ) && defined( __x86_64__ ) && !defined(__clang__)
+    if ( __builtin_setjmp((reinterpret_cast<rt_jpeg_error_mgr*>(cinfo.src))->error_jmp_buf) != 0 ) {
+#else
+    if ( setjmp((reinterpret_cast<rt_jpeg_error_mgr*>(cinfo.src))->error_jmp_buf) != 0 ) {
+#endif
+        jpeg_destroy_decompress(&cinfo);
+        return IMIO_HEADERERROR;
+    }
+
+    jpeg_read_header(&cinfo, TRUE);
+
+    if (cinfo.data_precision > 8) {
+        sFormat = IIOSF_UNSIGNED_SHORT;
+    }
+
+    jpeg_destroy_decompress(&cinfo);
+#endif
+
+    return IMIO_SUCCESS;
+}
+
 int ImageIO::loadJPEG (const Glib::ustring &fname)
 {
     std::unique_ptr<FILE, void (*)(FILE *)> file(
@@ -526,6 +634,17 @@ int ImageIO::loadJPEG (const Glib::ustring &fname)
 
         cinfo.out_color_space = JCS_RGB;
 
+#ifdef RT_JPEG_HIGH_PRECISION
+        // getJPEGSampleFormat() chose 16 bits for JPEGs with more than 8 bits per sample
+        const bool high_precision = sampleFormat == IIOSF_UNSIGNED_SHORT;
+
+        // libjpeg-turbo cannot convert the color space of lossless JPEGs, so
+        // grayscale ones are decoded as grayscale and expanded to RGB later
+        if (high_precision && cinfo.jpeg_color_space == JCS_GRAYSCALE) {
+            cinfo.out_color_space = JCS_GRAYSCALE;
+        }
+#endif
+
         deleteLoadedProfileData();
         bool hasprofile = read_icc_profile (&cinfo, (JOCTET**)&loadedProfileData, (unsigned int*)&loadedProfileLength);
 
@@ -541,6 +660,30 @@ int ImageIO::loadJPEG (const Glib::ustring &fname)
         unsigned int height = cinfo.output_height;
 
         allocate (width, height);
+
+#ifdef RT_JPEG_HIGH_PRECISION
+        if (high_precision) {
+            const bool success = readJPEGScanlines16(&cinfo, *this, pl, (1 << cinfo.data_precision) - 1);
+
+            if (success) {
+                jpeg_finish_decompress(&cinfo);
+            }
+
+            jpeg_destroy_decompress(&cinfo);
+            file.reset();
+
+            if (!success) {
+                return IMIO_READERROR;
+            }
+
+            if (pl) {
+                pl->setProgressStr ("PROGRESSBAR_READY");
+                pl->setProgress (1.0);
+            }
+
+            return IMIO_SUCCESS;
+        }
+#endif
 
         unsigned char *row = new unsigned char[width * 3];
 

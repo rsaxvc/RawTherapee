@@ -97,6 +97,7 @@ public:
     int loadPNG (const Glib::ustring &fname);
     int loadJPEG (const Glib::ustring &fname);
     int loadTIFF (const Glib::ustring &fname);
+    static int getJPEGSampleFormat (const Glib::ustring &fname, IIOSampleFormat &sFormat, IIOSampleArrangement &sArrangement);
     static int getPNGSampleFormat (const Glib::ustring &fname, IIOSampleFormat &sFormat, IIOSampleArrangement &sArrangement);
     static int getTIFFSampleFormat (const Glib::ustring &fname, IIOSampleFormat &sFormat, IIOSampleArrangement &sArrangement);
 
