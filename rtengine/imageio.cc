@@ -60,6 +60,10 @@
 // which decode 12-bit lossy and 9 to 16-bit lossless JPEGs
 #if defined(LIBJPEG_TURBO_VERSION_NUMBER) && LIBJPEG_TURBO_VERSION_NUMBER >= 3000000
 #define RT_JPEG_HIGH_PRECISION
+
+// libjpeg-turbo 3.1.90 added decoding 8-bit JPEGs with 12 bits per sample.
+// Older releases accept the request, but decode the image wrongly.
+constexpr bool JPEG_8_BIT_AT_12_BITS = LIBJPEG_TURBO_VERSION_NUMBER >= 3001090;
 #endif
 
 using namespace std;
@@ -117,10 +121,12 @@ void jpegRowToRgb16(const Sample *in, unsigned short *out, unsigned int width, i
     // Image16::setScanline() takes RGB only, so grayscale is expanded here
     const int step = components == 1 ? 0 : 1;
 
+    // an 8-bit JPEG decoded with 12 bits per sample can ring a little past
+    // its white level of 4080
     for (unsigned int i = 0; i < width; ++i, in += components) {
-        out[3 * i] = in[0] * scale + 0.5f;
-        out[3 * i + 1] = in[step] * scale + 0.5f;
-        out[3 * i + 2] = in[2 * step] * scale + 0.5f;
+        out[3 * i] = rtengine::min(in[0] * scale + 0.5f, 65535.f);
+        out[3 * i + 1] = rtengine::min(in[step] * scale + 0.5f, 65535.f);
+        out[3 * i + 2] = rtengine::min(in[2 * step] * scale + 0.5f, 65535.f);
     }
 }
 
@@ -582,7 +588,7 @@ int ImageIO::getJPEGSampleFormat (const Glib::ustring &fname, IIOSampleFormat &s
 
     jpeg_read_header(&cinfo, TRUE);
 
-    if (cinfo.data_precision > 8) {
+    if (cinfo.data_precision > 8 || JPEG_8_BIT_AT_12_BITS) {
         sFormat = IIOSF_UNSIGNED_SHORT;
     }
 
@@ -635,8 +641,18 @@ int ImageIO::loadJPEG (const Glib::ustring &fname)
         cinfo.out_color_space = JCS_RGB;
 
 #ifdef RT_JPEG_HIGH_PRECISION
-        // getJPEGSampleFormat() chose 16 bits for JPEGs with more than 8 bits per sample
+        // getJPEGSampleFormat() chose 16 bits for JPEGs decoded with more than 8 bits per sample
         const bool high_precision = sampleFormat == IIOSF_UNSIGNED_SHORT;
+        float white_level = (1 << cinfo.data_precision) - 1;
+
+        // The DCT coefficients of an 8-bit JPEG hold more than 8 bits of
+        // precision. Decoding with 12 bits per sample keeps it, for smoother
+        // gradients and shadows that survive being pushed. libjpeg-turbo
+        // scales the samples by 16, so white is 4080 rather than 4095.
+        if (JPEG_8_BIT_AT_12_BITS && high_precision && cinfo.data_precision == 8) {
+            cinfo.data_precision = 12;
+            white_level = 255 * 16;
+        }
 
         // libjpeg-turbo cannot convert the color space of lossless JPEGs, so
         // grayscale ones are decoded as grayscale and expanded to RGB later
@@ -663,7 +679,7 @@ int ImageIO::loadJPEG (const Glib::ustring &fname)
 
 #ifdef RT_JPEG_HIGH_PRECISION
         if (high_precision) {
-            const bool success = readJPEGScanlines16(&cinfo, *this, pl, (1 << cinfo.data_precision) - 1);
+            const bool success = readJPEGScanlines16(&cinfo, *this, pl, white_level);
 
             if (success) {
                 jpeg_finish_decompress(&cinfo);
